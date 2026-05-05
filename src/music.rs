@@ -78,8 +78,10 @@ end tell
     Ok(out)
 }
 
-/// Returns the `comment` ID3 tag of every track in the named user playlist.
-/// Used to seed yt-dlp's `--download-archive` so already-imported videos are skipped.
+/// Returns the YouTube video IDs found in the `comment` tag of every track in
+/// the named user playlist. Used to seed yt-dlp's `--download-archive` so
+/// already-imported videos are skipped. Comments may be a bare 11-char ID, a
+/// `youtube.com/watch?v=...` URL, or a `youtu.be/...` short link.
 pub async fn playlist_track_comments(name: &str) -> Result<Vec<String>> {
     let escaped = applescript_escape(name);
     let script = format!(
@@ -103,10 +105,27 @@ end tell
         escaped
     );
     let s = run_osascript(&script).await?;
-    Ok(s.lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect())
+    Ok(s.lines().filter_map(extract_youtube_id).collect())
+}
+
+fn extract_youtube_id(line: &str) -> Option<String> {
+    let s = line.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let candidate = if let Some(i) = s.find("v=") {
+        &s[i + 2..]
+    } else if let Some(i) = s.find("youtu.be/") {
+        &s[i + "youtu.be/".len()..]
+    } else {
+        s
+    };
+    let id: String = candidate.chars().take(11).collect();
+    (id.len() == 11
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    .then_some(id)
 }
 
 /// Add a single file to a user playlist (creating the playlist if missing).

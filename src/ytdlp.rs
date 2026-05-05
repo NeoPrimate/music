@@ -153,8 +153,6 @@ pub async fn download_playlist(
         .arg("--embed-thumbnail")
         .args(["--parse-metadata", "uploader:%(artist)s"])
         .args(["--parse-metadata", "playlist_title:%(album)s"])
-        // Embed the YouTube video ID in the m4a comment field for resume / dedup.
-        .args(["--parse-metadata", "%(id)s:%(meta_comment)s"])
         .arg("--no-quiet")
         .arg("--newline")
         .arg("--no-colors")
