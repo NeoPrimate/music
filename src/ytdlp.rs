@@ -1,6 +1,10 @@
 use crate::events::DownloadEvent;
+use crate::music;
 use color_eyre::eyre::{eyre, Result, WrapErr};
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use serde::Deserialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -43,8 +47,8 @@ pub async fn list_playlists(channel_url: &str, ytdlp: &Path) -> Result<Vec<Playl
         return Err(eyre!("yt-dlp produced no output: {}", stderr));
     }
 
-    let v: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .wrap_err("failed to parse yt-dlp JSON")?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&output.stdout).wrap_err("failed to parse yt-dlp JSON")?;
 
     let entries = v
         .get("entries")
@@ -75,7 +79,6 @@ pub async fn list_playlists(channel_url: &str, ytdlp: &Path) -> Result<Vec<Playl
 
 #[derive(Deserialize)]
 struct ProgressLine {
-    status: Option<String>,
     downloaded: Option<f64>,
     total: Option<f64>,
     speed: Option<f64>,
@@ -87,10 +90,14 @@ struct ProgressLine {
 
 const PROGRESS_TEMPLATE: &str = r#"download:PROGRESS:{"status":%(progress.status)j,"downloaded":%(progress.downloaded_bytes)j,"total":%(progress.total_bytes)j,"speed":%(progress.speed)j,"eta":%(progress.eta)j,"index":%(info.playlist_index)j,"total_tracks":%(info.playlist_count)j,"title":%(info.title)j}"#;
 
+/// Print line emitted after each track's m4a is finalized at its output path.
+const PRINT_TEMPLATE: &str = "after_move:IMPORT\t%(filepath)s\t%(id)s";
+
 pub async fn download_playlist(
     url: String,
     title: String,
     config: DownloadConfig,
+    archive_seed: Vec<String>,
     tx: mpsc::UnboundedSender<DownloadEvent>,
     cancel: CancellationToken,
 ) {
@@ -104,6 +111,25 @@ pub async fn download_playlist(
             return;
         }
     };
+
+    // Write the download archive (resume support).
+    let archive_path = staging.path().join("download-archive.txt");
+    if !archive_seed.is_empty() {
+        match std::fs::File::create(&archive_path) {
+            Ok(mut f) => {
+                for id in &archive_seed {
+                    let _ = writeln!(f, "youtube {id}");
+                }
+            }
+            Err(e) => {
+                let _ = tx.send(DownloadEvent::Failed {
+                    playlist_title: title,
+                    message: format!("archive: {e}"),
+                });
+                return;
+            }
+        }
+    }
 
     let _ = tx.send(DownloadEvent::Started {
         playlist_title: title.clone(),
@@ -127,10 +153,17 @@ pub async fn download_playlist(
         .arg("--embed-thumbnail")
         .args(["--parse-metadata", "uploader:%(artist)s"])
         .args(["--parse-metadata", "playlist_title:%(album)s"])
+        // Embed the YouTube video ID in the m4a comment field for resume / dedup.
+        .args(["--parse-metadata", "%(id)s:%(meta_comment)s"])
+        .arg("--no-quiet")
         .arg("--newline")
         .arg("--no-colors")
         .arg("--progress-template")
         .arg(PROGRESS_TEMPLATE)
+        .arg("--print")
+        .arg(PRINT_TEMPLATE)
+        .arg("--download-archive")
+        .arg(&archive_path)
         .arg("-o")
         .arg(&output_template)
         .arg(&url)
@@ -151,7 +184,6 @@ pub async fn download_playlist(
     let stdout = child.stdout.take().expect("stdout piped");
     let stderr = child.stderr.take().expect("stderr piped");
     let mut reader = BufReader::new(stdout).lines();
-    let mut last_track_done: u32 = 0;
 
     let stderr_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let stderr_log_writer = stderr_log.clone();
@@ -167,8 +199,20 @@ pub async fn download_playlist(
         }
     });
 
+    let mut imports: FuturesUnordered<
+        tokio::task::JoinHandle<std::result::Result<String, (String, String)>>,
+    > = FuturesUnordered::new();
+    let mut imported_count: u32 = 0;
+    let mut failed_count: u32 = 0;
+    let mut tracks_expected: Option<u32> = None;
+    let mut yt_done = false;
+
     loop {
+        if yt_done && imports.is_empty() {
+            break;
+        }
         tokio::select! {
+            biased;
             _ = cancel.cancelled() => {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -178,43 +222,70 @@ pub async fn download_playlist(
                 });
                 return;
             }
-            line = reader.next_line() => {
+            line = reader.next_line(), if !yt_done => {
                 match line {
                     Ok(Some(line)) => {
                         if let Some(payload) = line.strip_prefix("PROGRESS:") {
                             if let Ok(p) = serde_json::from_str::<ProgressLine>(payload) {
+                                if let Some(t) = p.total_tracks { if t > 0 { tracks_expected = Some(t); } }
                                 let percent = match (p.downloaded, p.total) {
                                     (Some(d), Some(t)) if t > 0.0 => ((d / t) * 100.0) as f32,
                                     _ => 0.0,
                                 };
-                                let track_index = p.index.unwrap_or(0);
-                                let track_total = p.total_tracks.unwrap_or(0);
-                                let track_title = p.title.unwrap_or_default();
-                                let status_s = p.status.as_deref().unwrap_or("");
-
-                                if status_s == "finished" && track_index > last_track_done {
-                                    last_track_done = track_index;
-                                    let _ = tx.send(DownloadEvent::TrackDone {
-                                        playlist_title: title.clone(),
-                                        track_index,
-                                        track_total,
-                                    });
-                                }
-
                                 let _ = tx.send(DownloadEvent::Progress {
                                     playlist_title: title.clone(),
-                                    track_index,
-                                    track_total,
-                                    track_title,
+                                    track_index: p.index.unwrap_or(0),
+                                    track_total: p.total_tracks.unwrap_or(0),
+                                    track_title: p.title.unwrap_or_default(),
                                     percent,
                                     speed: p.speed,
                                     eta: p.eta,
                                 });
                             }
+                        } else if let Some(payload) = line.strip_prefix("IMPORT\t") {
+                            // payload is "filepath\tvideo_id"
+                            if let Some((filepath, vid)) = payload.split_once('\t') {
+                                let file = PathBuf::from(filepath);
+                                let vid = vid.to_string();
+                                let title2 = title.clone();
+                                let vid_for_task = vid.clone();
+                                let task = tokio::spawn(async move {
+                                    match music::add_file_to_playlist(&title2, &file).await {
+                                        Ok(()) => {
+                                            let _ = std::fs::remove_file(&file);
+                                            Ok(vid_for_task)
+                                        }
+                                        Err(e) => Err((vid_for_task, e.to_string())),
+                                    }
+                                });
+                                imports.push(task);
+                            }
                         }
                     }
-                    Ok(None) => break,
-                    Err(_) => break,
+                    Ok(None) => { yt_done = true; }
+                    Err(_) => { yt_done = true; }
+                }
+            }
+            Some(joined) = imports.next() => {
+                match joined {
+                    Ok(Ok(vid)) => {
+                        imported_count += 1;
+                        let _ = tx.send(DownloadEvent::TrackImported {
+                            playlist_title: title.clone(),
+                            video_id: vid,
+                        });
+                    }
+                    Ok(Err((vid, msg))) => {
+                        failed_count += 1;
+                        let _ = tx.send(DownloadEvent::TrackFailed {
+                            playlist_title: title.clone(),
+                            video_id: vid,
+                            message: msg,
+                        });
+                    }
+                    Err(_) => {
+                        failed_count += 1;
+                    }
                 }
             }
         }
@@ -223,23 +294,8 @@ pub async fn download_playlist(
     let _ = child.wait().await;
     let _ = stderr_task.await;
 
-    // Collect .m4a files even if yt-dlp partially failed.
-    let files = match std::fs::read_dir(staging.path()) {
-        Ok(dir) => {
-            let mut v: Vec<PathBuf> = dir
-                .filter_map(|e| {
-                    let e = e.ok()?;
-                    let p = e.path();
-                    (p.extension().and_then(|s| s.to_str()) == Some("m4a")).then_some(p)
-                })
-                .collect();
-            v.sort();
-            v
-        }
-        Err(_) => Vec::new(),
-    };
-
-    if files.is_empty() {
+    if imported_count == 0 && failed_count == 0 {
+        // yt-dlp ran but produced no IMPORT lines.
         let log = stderr_log.lock().expect("stderr log poisoned");
         let last_error = log
             .iter()
@@ -248,15 +304,22 @@ pub async fn download_playlist(
             .cloned()
             .or_else(|| log.last().cloned())
             .unwrap_or_else(|| "(no stderr output)".to_string());
-        let _ = tx.send(DownloadEvent::Failed {
-            playlist_title: title,
-            message: format!("no tracks downloaded — {last_error}"),
-        });
-    } else {
-        let _ = tx.send(DownloadEvent::Finished {
-            playlist_title: title,
-            files,
-            staging: Arc::new(staging),
-        });
+        // archive_seed.is_empty() means there was nothing already imported,
+        // so 0/0 really means failure. Otherwise it's "everything was already imported".
+        if archive_seed.is_empty() {
+            let _ = tx.send(DownloadEvent::Failed {
+                playlist_title: title,
+                message: format!("no tracks downloaded — {last_error}"),
+            });
+            return;
+        }
     }
+
+    let _ = tx.send(DownloadEvent::ImportDone {
+        playlist_title: title,
+        tracks_imported: imported_count,
+        tracks_expected,
+    });
+
+    drop(staging);
 }

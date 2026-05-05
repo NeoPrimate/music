@@ -1,8 +1,5 @@
 use crate::music::LibraryPlaylist;
 use crate::ytdlp::PlaylistEntry;
-use std::path::PathBuf;
-use std::sync::Arc;
-use tempfile::TempDir;
 
 #[derive(Debug)]
 pub enum DownloadEvent {
@@ -18,22 +15,26 @@ pub enum DownloadEvent {
         speed: Option<f64>,
         eta: Option<u64>,
     },
-    TrackDone {
+    /// One file finished download+postprocess and was successfully imported into Music.app.
+    TrackImported {
+        playlist_title: String,
+        #[allow(dead_code)]
+        video_id: String,
+    },
+    /// One file finished download+postprocess but failed to import.
+    TrackFailed {
         #[allow(dead_code)]
         playlist_title: String,
         #[allow(dead_code)]
-        track_index: u32,
+        video_id: String,
         #[allow(dead_code)]
-        track_total: u32,
+        message: String,
     },
-    Finished {
-        playlist_title: String,
-        files: Vec<PathBuf>,
-        staging: Arc<TempDir>,
-    },
+    /// Final terminal state for a playlist run.
     ImportDone {
         playlist_title: String,
         tracks_imported: u32,
+        tracks_expected: Option<u32>,
     },
     Failed {
         playlist_title: String,

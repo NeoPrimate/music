@@ -1,152 +1,92 @@
 # yt-music-tui
 
-A Rust TUI that downloads YouTube playlists into Apple Music with parallel
-downloads, live progress bars, and library management.
+Download YouTube playlists into Apple Music from a terminal TUI.
+Parallel downloads, live progress, resume, dedupe, library cleanup.
 
-## What it does
-
-- Lists all playlists from a YouTube channel's `/playlists` page.
-- Multi-select playlists, download in parallel (configurable concurrency).
-- Each YouTube playlist becomes a same-named user playlist in Music.app
-  (cover art + metadata embedded).
-- A second tab lists existing Music.app user playlists; multi-select delete
-  with a confirmation modal.
-
-## Requirements
-
-macOS (Apple Silicon tested) and the following Homebrew packages:
+## Install
 
 ```sh
 brew install yt-dlp ffmpeg deno
-```
-
-`deno` is required by yt-dlp's current YouTube extractor.
-
-Music.app must have **"Copy files to Media folder when adding to library"**
-enabled (Music → Settings → Files). The app refuses to start if it's off.
-
-### YouTube cookies
-
-YouTube's anti-bot check requires authenticated cookies for most downloads.
-The default is `--browser safari`, which means yt-dlp reads cookies from
-Safari. On macOS this requires your terminal (Alacritty / Terminal /
-iTerm / etc.) to have **Full Disk Access**:
-
-System Settings → Privacy & Security → Full Disk Access → add your terminal
-app.
-
-Alternatives:
-
-- `--browser firefox` — Firefox stores cookies in a user-readable location,
-  no Full Disk Access needed. Just be logged in to YouTube in Firefox.
-- `--browser chrome` — same idea.
-- `--browser none` — skip cookies entirely. Only works for playlists
-  YouTube doesn't bot-check.
-
-## Build
-
-```sh
+git clone git@github.com:NeoPrimate/music.git
+cd music
 cargo build --release
 ```
 
-The binary lands at `./target/release/yt-music-tui`.
+Binary: `./target/release/yt-music-tui`.
 
-## Usage
+## Before first run
 
-```sh
-yt-music-tui [OPTIONS]
-```
+1. **Music.app → Settings → Files**: enable
+   *"Copy files to Music Media folder when adding to library."*
+   The app refuses to start without it.
+2. **YouTube cookies** are required (anti-bot). Either:
+   - log in to YouTube in **Firefox** and run with `--browser firefox`, or
+   - log in in **Safari** and grant your terminal *Full Disk Access*
+     (System Settings → Privacy & Security → Full Disk Access).
 
-Options:
-
-| flag                  | default                                                  |
-|-----------------------|----------------------------------------------------------|
-| `-c, --channel <URL>` | `https://www.youtube.com/@NeotenicApe/playlists`         |
-| `-j, --parallelism N` | `3`                                                      |
-| `--ytdlp <PATH>`      | `/opt/homebrew/bin/yt-dlp`                               |
-| `--ffmpeg <PATH>`     | `/opt/homebrew/bin/ffmpeg`                               |
-| `--browser <NAME>`    | `safari` (also: `firefox`, `chrome`, `edge`, `none`)     |
-
-Examples:
+## Run
 
 ```sh
-# default channel, 3-way parallel, Safari cookies
-yt-music-tui
-
-# custom channel, 5 concurrent downloads, Firefox cookies
-yt-music-tui -c 'https://www.youtube.com/@SomeChannel/playlists' -j 5 --browser firefox
+./target/release/yt-music-tui                    # defaults
+./target/release/yt-music-tui --browser firefox  # recommended
+./target/release/yt-music-tui -c <channel-url> -j 5 --browser firefox
 ```
+
+| flag                  | default                                                |
+|-----------------------|--------------------------------------------------------|
+| `-c, --channel <URL>` | `https://www.youtube.com/@NeotenicApe/playlists`       |
+| `-j, --parallelism N` | `3`                                                    |
+| `--browser <NAME>`    | `safari` · `firefox` · `chrome` · `edge` · `none`      |
+| `--ytdlp <PATH>`      | `/opt/homebrew/bin/yt-dlp`                             |
+| `--ffmpeg <PATH>`     | `/opt/homebrew/bin/ffmpeg`                             |
 
 ## Keys
 
-Global:
+**Global:** `q` quit · `Tab` / `1` / `2` switch tabs · `r` refresh
 
-| key             | action       |
-|-----------------|--------------|
-| `q` / `Ctrl-C`  | quit         |
-| `Tab` / `1`/`2` | switch tab   |
-| `r`             | refresh      |
+**Download tab:**
+`↑↓` / `jk` move · `Space` select · `a` select all · `Enter` / `d` download
 
-Download tab:
+**Library tab:**
+`↑↓` / `jk` move · `Space` select · `a` select all
+`x` delete playlist (tracks stay) · `X` delete playlist + its tracks
 
-| key            | action                               |
-|----------------|--------------------------------------|
-| `↑↓` / `j` `k` | move cursor                          |
-| `Space`        | toggle selection                     |
-| `a`            | toggle select all                    |
-| `Enter` / `d`  | download selected (skips in-flight)  |
-
-Library tab:
-
-| key            | action                          |
-|----------------|---------------------------------|
-| `↑↓` / `j` `k` | move cursor                     |
-| `Space`        | toggle selection                |
-| `a`            | toggle select all               |
-| `x` / `Del`    | delete selected (with confirm)  |
-
-In the delete confirm modal: `y` confirm, `n` / `Esc` cancel.
-
-## How it works
-
-1. On startup, runs `yt-dlp --flat-playlist -J <channel>` to enumerate
-   playlists.
-2. Selecting playlists and pressing Enter spawns one tokio task per
-   playlist, gated by an `Arc<Semaphore>` so at most `--parallelism`
-   downloads run concurrently.
-3. Each download task spawns yt-dlp with a JSON progress template
-   (`--progress-template`) and parses progress events line-by-line into
-   percent / speed / ETA / current track.
-4. The playlist downloads to a per-task `TempDir` (`$TMPDIR/.tmpXXXX/`).
-   yt-dlp's `--ignore-errors` keeps it going past unavailable / private
-   videos; partial successes are still imported.
-5. When download finishes, status flips to `Importing` and an AppleScript
-   (`osascript`) creates (or finds) the user playlist and adds each
-   `.m4a` file to it. Music.app's "copy to Media folder" setting takes
-   over, so the staging dir is dropped immediately after import.
-6. Library tab is refreshed automatically after each successful import.
+In a confirm modal: `y` yes · `n` / `Esc` no.
 
 ## Status badges
 
-| badge          | meaning                                |
-|----------------|----------------------------------------|
-| `⏳ queued`    | waiting on a parallelism slot          |
-| `⟳`            | downloading                            |
-| `⇒♫`           | downloading done, importing to Music   |
-| `✓ N imported` | done, N tracks in the Music playlist   |
-| `✗ <message>`  | failed (yt-dlp's error is shown)       |
+| badge                            | meaning                                     |
+|----------------------------------|---------------------------------------------|
+| (none)                           | not in Music yet                            |
+| `📚 in library (N)`              | Music already has this playlist (N tracks) |
+| `⟳ N/M`                          | downloading / importing                     |
+| `✓ N/M imported`                 | complete                                    |
+| `◐ N/M imported (partial)`       | some videos failed (private / unavailable) |
+| `✓ already up to date`           | nothing new since last run                  |
+| `✗ <message>`                    | failed (yt-dlp error shown)                 |
+
+## How it works
+
+1. Each download writes to its own `TempDir`. As yt-dlp finishes a track,
+   it streams `IMPORT\t<file>\t<video_id>` on stdout.
+2. The TUI immediately runs an AppleScript `add` to put that file in the
+   matching Music.app user playlist (creating it if missing), then deletes
+   the staging file. Music.app keeps its own copy in the Media folder.
+3. Each track's YouTube video ID is embedded in the m4a `comment` tag, so
+   re-running a playlist seeds yt-dlp's `--download-archive` from the
+   existing Music tracks — already-imported videos are skipped.
+4. Interrupt at any time. What was already imported is safe in Music; only
+   the in-flight track is lost. Re-run picks up where it stopped.
 
 ## Troubleshooting
 
 **`✗ no tracks downloaded — ERROR: ... Sign in to confirm you're not a bot`**
-→ See the cookies section above. Either grant terminal Full Disk Access
-for Safari, or use `--browser firefox`.
+You need cookies. Use `--browser firefox` (after logging in via Firefox)
+or grant the terminal Full Disk Access for Safari cookies.
 
-**Pre-flight fails with "Copy files to Media folder ... is OFF"**
-→ Music → Settings → Files → check the "Copy files to Music Media folder
-when adding to library" box.
+**`Music.app's 'Copy files to Media folder ...' is OFF`**
+Music → Settings → Files → check that box.
 
-**Downloaded but not in Music yet**
-→ Tracks only appear in Music.app after the *entire* playlist finishes
-downloading and the status badge flips to `✓ N imported`. Three
-parallel playlists means three full downloads complete first.
+**Tracks downloaded but resume keeps re-downloading**
+The YouTube-ID-in-comment tag isn't being applied. Verify in Music.app:
+right-click a track → Get Info → Comments. Should show an 11-char video ID.

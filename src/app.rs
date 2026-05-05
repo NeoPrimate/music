@@ -15,6 +15,10 @@ pub enum Tab {
 
 #[derive(Debug, Clone)]
 pub enum DownloadStatus {
+    /// We saw a Music.app playlist with the same name on startup; not yet (re-)run.
+    InLibrary {
+        tracks_in_music: u32,
+    },
     Queued,
     Running {
         track_index: u32,
@@ -23,10 +27,11 @@ pub enum DownloadStatus {
         percent: f32,
         speed: Option<f64>,
         eta: Option<u64>,
+        imported_so_far: u32,
     },
-    Importing,
     Done {
         tracks_imported: u32,
+        tracks_expected: Option<u32>,
     },
     Failed {
         message: String,
@@ -36,6 +41,7 @@ pub enum DownloadStatus {
 #[derive(Debug, Clone)]
 pub enum ConfirmKind {
     DeletePlaylists(Vec<String>),
+    DeletePlaylistsAndTracks(Vec<String>),
 }
 
 pub struct App {
@@ -68,7 +74,7 @@ impl App {
         app_tx: mpsc::UnboundedSender<AppEvent>,
         cancel: CancellationToken,
     ) -> Self {
-        Self {
+        let mut s = Self {
             tab: Tab::Download,
             playlists,
             library,
@@ -85,6 +91,26 @@ impl App {
             sem: Arc::new(Semaphore::new(parallelism.max(1))),
             app_tx,
             cancel,
+        };
+        s.sync_startup_statuses();
+        s
+    }
+
+    fn sync_startup_statuses(&mut self) {
+        let by_name: HashMap<&str, &LibraryPlaylist> = self
+            .library
+            .iter()
+            .map(|lp| (lp.name.as_str(), lp))
+            .collect();
+        for p in &self.playlists {
+            if let Some(lp) = by_name.get(p.title.as_str()) {
+                self.statuses.insert(
+                    p.title.clone(),
+                    DownloadStatus::InLibrary {
+                        tracks_in_music: lp.track_count,
+                    },
+                );
+            }
         }
     }
 
@@ -138,11 +164,15 @@ impl App {
 
     fn handle_modal_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(ConfirmKind::DeletePlaylists(names)) = self.confirm.take() {
-                    self.execute_delete(names);
+            KeyCode::Char('y') | KeyCode::Char('Y') => match self.confirm.take() {
+                Some(ConfirmKind::DeletePlaylists(names)) => {
+                    self.execute_delete(names, false);
                 }
-            }
+                Some(ConfirmKind::DeletePlaylistsAndTracks(names)) => {
+                    self.execute_delete(names, true);
+                }
+                None => {}
+            },
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.confirm = None;
             }
@@ -214,18 +244,27 @@ impl App {
                 }
             }
             KeyCode::Char('x') | KeyCode::Delete => {
-                let mut idxs: Vec<usize> = self.library_selected.iter().copied().collect();
-                idxs.sort();
-                let names: Vec<String> = idxs
-                    .iter()
-                    .filter_map(|&i| self.library.get(i).map(|lp| lp.name.clone()))
-                    .collect();
+                let names = self.selected_library_names();
                 if !names.is_empty() {
                     self.confirm = Some(ConfirmKind::DeletePlaylists(names));
                 }
             }
+            KeyCode::Char('X') => {
+                let names = self.selected_library_names();
+                if !names.is_empty() {
+                    self.confirm = Some(ConfirmKind::DeletePlaylistsAndTracks(names));
+                }
+            }
             _ => {}
         }
+    }
+
+    fn selected_library_names(&self) -> Vec<String> {
+        let mut idxs: Vec<usize> = self.library_selected.iter().copied().collect();
+        idxs.sort();
+        idxs.iter()
+            .filter_map(|&i| self.library.get(i).map(|lp| lp.name.clone()))
+            .collect()
     }
 
     fn start_downloads(&mut self) {
@@ -241,11 +280,7 @@ impl App {
             };
             if matches!(
                 self.statuses.get(&p.title),
-                Some(
-                    DownloadStatus::Running { .. }
-                        | DownloadStatus::Importing
-                        | DownloadStatus::Queued
-                )
+                Some(DownloadStatus::Running { .. } | DownloadStatus::Queued)
             ) {
                 continue;
             }
@@ -261,6 +296,12 @@ impl App {
                     Ok(p) => p,
                     Err(_) => return,
                 };
+
+                // Seed the download archive from the matching Music playlist (if any).
+                let archive_seed = music::playlist_track_comments(&p.title)
+                    .await
+                    .unwrap_or_default();
+
                 let (dtx, mut drx) = mpsc::unbounded_channel::<DownloadEvent>();
                 let app_tx2 = app_tx.clone();
                 let forwarder = tokio::spawn(async move {
@@ -270,7 +311,7 @@ impl App {
                         }
                     }
                 });
-                ytdlp::download_playlist(p.url, p.title, cfg, dtx, cancel).await;
+                ytdlp::download_playlist(p.url, p.title, cfg, archive_seed, dtx, cancel).await;
                 let _ = forwarder.await;
             });
         }
@@ -312,6 +353,7 @@ impl App {
                         percent: 0.0,
                         speed: None,
                         eta: None,
+                        imported_so_far: 0,
                     },
                 );
             }
@@ -324,6 +366,12 @@ impl App {
                 speed,
                 eta,
             } => {
+                let imported_so_far = match self.statuses.get(&playlist_title) {
+                    Some(DownloadStatus::Running {
+                        imported_so_far, ..
+                    }) => *imported_so_far,
+                    _ => 0,
+                };
                 self.statuses.insert(
                     playlist_title,
                     DownloadStatus::Running {
@@ -333,54 +381,38 @@ impl App {
                         percent,
                         speed,
                         eta,
+                        imported_so_far,
                     },
                 );
             }
-            DownloadEvent::TrackDone { .. } => {}
-            DownloadEvent::Finished {
-                playlist_title,
-                files,
-                staging,
-            } => {
-                self.statuses
-                    .insert(playlist_title.clone(), DownloadStatus::Importing);
-                let app_tx = self.app_tx.clone();
-                tokio::spawn(async move {
-                    let res = music::import_playlist(&playlist_title, &files).await;
-                    drop(staging);
-                    match res {
-                        Ok(n) => {
-                            let _ = app_tx.send(AppEvent::Download(DownloadEvent::ImportDone {
-                                playlist_title,
-                                tracks_imported: n,
-                            }));
-                            match music::list_user_playlists().await {
-                                Ok(lp) => {
-                                    let _ = app_tx.send(AppEvent::LibraryRefreshed(lp));
-                                }
-                                Err(e) => {
-                                    let _ =
-                                        app_tx.send(AppEvent::BackgroundError(e.to_string()));
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let _ = app_tx.send(AppEvent::Download(DownloadEvent::Failed {
-                                playlist_title,
-                                message: format!("import: {e}"),
-                            }));
-                        }
-                    }
-                });
+            DownloadEvent::TrackImported { playlist_title, .. } => {
+                if let Some(DownloadStatus::Running {
+                    imported_so_far, ..
+                }) = self.statuses.get_mut(&playlist_title)
+                {
+                    *imported_so_far += 1;
+                }
             }
+            DownloadEvent::TrackFailed { .. } => {}
             DownloadEvent::ImportDone {
                 playlist_title,
                 tracks_imported,
+                tracks_expected,
             } => {
                 self.statuses.insert(
                     playlist_title,
-                    DownloadStatus::Done { tracks_imported },
+                    DownloadStatus::Done {
+                        tracks_imported,
+                        tracks_expected,
+                    },
                 );
+                // refresh library so the new playlist shows up there
+                let app_tx = self.app_tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(lp) = music::list_user_playlists().await {
+                        let _ = app_tx.send(AppEvent::LibraryRefreshed(lp));
+                    }
+                });
             }
             DownloadEvent::Failed {
                 playlist_title,
@@ -422,12 +454,17 @@ impl App {
         self.status_msg = Some("refreshing...".to_string());
     }
 
-    fn execute_delete(&mut self, names: Vec<String>) {
+    fn execute_delete(&mut self, names: Vec<String>, with_tracks: bool) {
         let app_tx = self.app_tx.clone();
         tokio::spawn(async move {
             let mut errors = Vec::new();
             for name in &names {
-                if let Err(e) = music::delete_user_playlist(name).await {
+                let res = if with_tracks {
+                    music::delete_playlist_and_tracks(name).await
+                } else {
+                    music::delete_user_playlist(name).await
+                };
+                if let Err(e) = res {
                     errors.push(format!("{name}: {e}"));
                 }
             }

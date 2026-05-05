@@ -1,5 +1,5 @@
 use color_eyre::eyre::{eyre, Result, WrapErr};
-use std::path::PathBuf;
+use std::path::Path;
 use tokio::process::Command;
 
 #[derive(Debug, Clone)]
@@ -78,6 +78,60 @@ end tell
     Ok(out)
 }
 
+/// Returns the `comment` ID3 tag of every track in the named user playlist.
+/// Used to seed yt-dlp's `--download-archive` so already-imported videos are skipped.
+pub async fn playlist_track_comments(name: &str) -> Result<Vec<String>> {
+    let escaped = applescript_escape(name);
+    let script = format!(
+        r#"
+tell application "Music"
+    set output to ""
+    try
+        set p to user playlist "{}"
+        repeat with t in (every track of p)
+            try
+                set c to (comment of t)
+                if c is not "" then
+                    set output to output & c & linefeed
+                end if
+            end try
+        end repeat
+    end try
+    return output
+end tell
+"#,
+        escaped
+    );
+    let s = run_osascript(&script).await?;
+    Ok(s.lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect())
+}
+
+/// Add a single file to a user playlist (creating the playlist if missing).
+pub async fn add_file_to_playlist(name: &str, file: &Path) -> Result<()> {
+    let escaped_name = applescript_escape(name);
+    let escaped_path = applescript_escape(&file.to_string_lossy());
+    let script = format!(
+        r#"
+tell application "Music"
+    set playlistName to "{name}"
+    if not (exists user playlist playlistName) then
+        make new user playlist with properties {{name:playlistName}}
+    end if
+    set targetPlaylist to user playlist playlistName
+    add (POSIX file "{path}") to targetPlaylist
+end tell
+"#,
+        name = escaped_name,
+        path = escaped_path
+    );
+    run_osascript(&script).await?;
+    Ok(())
+}
+
+/// Delete the named user playlist (does NOT delete the underlying tracks).
 pub async fn delete_user_playlist(name: &str) -> Result<()> {
     let escaped = applescript_escape(name);
     let script = format!(
@@ -94,34 +148,32 @@ end tell
     Ok(())
 }
 
-pub async fn import_playlist(name: &str, files: &[PathBuf]) -> Result<u32> {
-    if files.is_empty() {
-        return Ok(0);
-    }
-    let escaped_name = applescript_escape(name);
-    let mut adds = String::new();
-    for f in files {
-        let p = applescript_escape(&f.to_string_lossy());
-        adds.push_str(&format!(
-            "    try\n        add (POSIX file \"{}\") to targetPlaylist\n    end try\n",
-            p
-        ));
-    }
+/// Delete a user playlist AND every track that was in it from the library
+/// (frees disk space; tracks go to Music.app's trash subject to its settings).
+pub async fn delete_playlist_and_tracks(name: &str) -> Result<()> {
+    let escaped = applescript_escape(name);
     let script = format!(
         r#"
 tell application "Music"
-    set playlistName to "{name}"
-    if not (exists user playlist playlistName) then
-        make new user playlist with properties {{name:playlistName}}
-    end if
-    set targetPlaylist to user playlist playlistName
-{adds}
-    return (count of tracks of targetPlaylist) as text
+    try
+        set p to user playlist "{}"
+        set theIds to {{}}
+        repeat with t in (every track of p)
+            try
+                set end of theIds to persistent ID of t
+            end try
+        end repeat
+        delete p
+        repeat with anId in theIds
+            try
+                delete (every track of library playlist 1 whose persistent ID is anId)
+            end try
+        end repeat
+    end try
 end tell
 "#,
-        name = escaped_name,
-        adds = adds
+        escaped
     );
-    let out = run_osascript(&script).await?;
-    Ok(out.parse::<u32>().unwrap_or(files.len() as u32))
+    run_osascript(&script).await?;
+    Ok(())
 }

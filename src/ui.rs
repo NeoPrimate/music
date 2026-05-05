@@ -2,7 +2,9 @@ use crate::app::{App, ConfirmKind, DownloadStatus, Tab};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Tabs, Wrap,
+};
 use ratatui::Frame;
 
 pub fn render(f: &mut Frame, app: &App) {
@@ -53,14 +55,7 @@ fn collect_active(app: &App) -> Vec<(String, DownloadStatus)> {
     let mut v: Vec<(String, DownloadStatus)> = app
         .statuses
         .iter()
-        .filter(|(_, s)| {
-            matches!(
-                s,
-                DownloadStatus::Running { .. }
-                    | DownloadStatus::Importing
-                    | DownloadStatus::Queued
-            )
-        })
+        .filter(|(_, s)| matches!(s, DownloadStatus::Running { .. } | DownloadStatus::Queued))
         .map(|(k, s)| (k.clone(), s.clone()))
         .collect();
     v.sort_by(|a, b| a.0.cmp(&b.0));
@@ -86,6 +81,67 @@ fn render_download(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn status_badge(status: Option<&DownloadStatus>) -> (String, Style) {
+    match status {
+        Some(DownloadStatus::InLibrary { tracks_in_music }) => (
+            format!("  📚 in library ({tracks_in_music})"),
+            Style::default().fg(Color::Blue),
+        ),
+        Some(DownloadStatus::Queued) => (
+            "  ⏳ queued".to_string(),
+            Style::default().fg(Color::Gray),
+        ),
+        Some(DownloadStatus::Running {
+            imported_so_far,
+            track_total,
+            ..
+        }) => {
+            let counts = if *track_total > 0 {
+                format!(" {imported_so_far}/{track_total}")
+            } else if *imported_so_far > 0 {
+                format!(" {imported_so_far}")
+            } else {
+                String::new()
+            };
+            (
+                format!("  ⟳{counts}"),
+                Style::default().fg(Color::Yellow),
+            )
+        }
+        Some(DownloadStatus::Done {
+            tracks_imported,
+            tracks_expected,
+        }) => match tracks_expected {
+            Some(exp) if *tracks_imported >= *exp => (
+                format!("  ✓ {tracks_imported}/{exp} imported"),
+                Style::default().fg(Color::Green),
+            ),
+            Some(exp) => (
+                format!("  ◐ {tracks_imported}/{exp} imported (partial)"),
+                Style::default().fg(Color::Yellow),
+            ),
+            None => {
+                if *tracks_imported == 0 {
+                    (
+                        "  ✓ already up to date".to_string(),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    (
+                        format!("  ✓ {tracks_imported} new imported"),
+                        Style::default().fg(Color::Green),
+                    )
+                }
+            }
+        },
+        Some(DownloadStatus::Failed { message }) => (
+            format!("  ✗ {}", truncate(message, 60)),
+            Style::default().fg(Color::Red),
+        ),
+        None => (String::new(), Style::default()),
+    }
+}
+
 fn render_playlists(f: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> = app
         .playlists
@@ -98,32 +154,14 @@ fn render_playlists(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 "[ ] "
             };
-            let (badge, badge_style) = match app.statuses.get(&p.title) {
-                Some(DownloadStatus::Queued) => {
-                    ("  ⏳ queued".to_string(), Style::default().fg(Color::Gray))
-                }
-                Some(DownloadStatus::Running { .. }) => {
-                    ("  ⟳".to_string(), Style::default().fg(Color::Yellow))
-                }
-                Some(DownloadStatus::Importing) => {
-                    ("  ⇒♫".to_string(), Style::default().fg(Color::Cyan))
-                }
-                Some(DownloadStatus::Done { tracks_imported }) => (
-                    format!("  ✓ {tracks_imported} imported"),
-                    Style::default().fg(Color::Green),
-                ),
-                Some(DownloadStatus::Failed { message }) => (
-                    format!("  ✗ {}", truncate(message, 40)),
-                    Style::default().fg(Color::Red),
-                ),
-                None => (String::new(), Style::default()),
-            };
+            let (badge, badge_style) = status_badge(app.statuses.get(&p.title));
             let title_style = match app.statuses.get(&p.title) {
                 Some(DownloadStatus::Done { .. }) => Style::default().fg(Color::Green),
                 Some(DownloadStatus::Failed { .. }) => Style::default().fg(Color::Red),
-                Some(DownloadStatus::Running { .. }) => Style::default().fg(Color::Yellow),
-                Some(DownloadStatus::Importing) => Style::default().fg(Color::Cyan),
-                Some(DownloadStatus::Queued) => Style::default().fg(Color::Gray),
+                Some(DownloadStatus::Running { .. } | DownloadStatus::Queued) => {
+                    Style::default().fg(Color::Yellow)
+                }
+                Some(DownloadStatus::InLibrary { .. }) => Style::default().fg(Color::Blue),
                 None => Style::default(),
             };
             ListItem::new(Line::from(vec![
@@ -141,7 +179,11 @@ fn render_playlists(f: &mut Frame, app: &App, area: Rect) {
         app.download_selected.len()
     );
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(list, area);
+    let mut state = ListState::default();
+    if !app.playlists.is_empty() {
+        state.select(Some(app.download_cursor));
+    }
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_active_downloads(f: &mut Frame, active: &[(String, DownloadStatus)], area: Rect) {
@@ -187,6 +229,7 @@ fn render_active_downloads(f: &mut Frame, active: &[(String, DownloadStatus)], a
                 percent,
                 speed,
                 eta,
+                imported_so_far,
             } => {
                 let speed_s = match speed {
                     Some(s) if *s > 0.0 => format!("{:.2} MiB/s", s / 1024.0 / 1024.0),
@@ -201,7 +244,9 @@ fn render_active_downloads(f: &mut Frame, active: &[(String, DownloadStatus)], a
                 } else {
                     format!("{}", track_index)
                 };
-                let header_right = format!("{counts}  {speed_s}  ETA {eta_s}");
+                let header_right = format!(
+                    "{counts}  {speed_s}  ETA {eta_s}  imported {imported_so_far}"
+                );
                 let pct_u = (*percent).clamp(0.0, 100.0) as u16;
                 (
                     header_right,
@@ -211,13 +256,6 @@ fn render_active_downloads(f: &mut Frame, active: &[(String, DownloadStatus)], a
                     format!("Currently: {track_title}"),
                 )
             }
-            DownloadStatus::Importing => (
-                "importing → Music.app".to_string(),
-                "100%".to_string(),
-                100u16,
-                Color::Cyan,
-                String::new(),
-            ),
             _ => continue,
         };
 
@@ -275,13 +313,21 @@ fn render_library(f: &mut Frame, app: &App, area: Rect) {
         app.library_selected.len()
     );
     let list = List::new(items).block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(list, area);
+    let mut state = ListState::default();
+    if !app.library.is_empty() {
+        state.select(Some(app.library_cursor));
+    }
+    f.render_stateful_widget(list, area, &mut state);
 }
 
 fn render_footer(f: &mut Frame, app: &App, area: Rect) {
     let hint = match app.tab {
-        Tab::Download => "↑↓/jk move  ␣ select  a all  ⏎/d download  Tab switch  r refresh  q quit",
-        Tab::Library => "↑↓/jk move  ␣ select  a all  x delete  Tab switch  r refresh  q quit",
+        Tab::Download => {
+            "↑↓/jk move  ␣ select  a all  ⏎/d download  Tab switch  r refresh  q quit"
+        }
+        Tab::Library => {
+            "↑↓/jk move  ␣ select  a all  x del playlist  X del + tracks  Tab switch  r refresh  q quit"
+        }
     };
     let line = if let Some(s) = &app.status_msg {
         format!("{hint}  |  {s}")
@@ -301,7 +347,7 @@ fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmKind) {
         ConfirmKind::DeletePlaylists(names) => {
             let mut lines: Vec<Line> = vec![
                 Line::from(format!(
-                    "Delete {} Music.app playlist(s)?",
+                    "Delete {} Music.app playlist(s)? (tracks remain in library)",
                     names.len()
                 )),
                 Line::from(""),
@@ -317,7 +363,30 @@ fn render_confirm(f: &mut Frame, area: Rect, c: &ConfirmKind) {
                 Line::from("Press y to confirm, n / Esc to cancel.")
                     .style(Style::default().fg(Color::Yellow)),
             );
-            ("Confirm delete", lines)
+            ("Confirm delete (playlist only)", lines)
+        }
+        ConfirmKind::DeletePlaylistsAndTracks(names) => {
+            let mut lines: Vec<Line> = vec![
+                Line::from(format!(
+                    "Delete {} playlist(s) AND remove their tracks from the Music library?",
+                    names.len()
+                ))
+                .style(Style::default().fg(Color::Red)),
+                Line::from("(frees disk space — files go to Music.app's trash)"),
+                Line::from(""),
+            ];
+            for n in names.iter().take(8) {
+                lines.push(Line::from(format!("  • {n}")));
+            }
+            if names.len() > 8 {
+                lines.push(Line::from(format!("  … and {} more", names.len() - 8)));
+            }
+            lines.push(Line::from(""));
+            lines.push(
+                Line::from("Press y to confirm, n / Esc to cancel.")
+                    .style(Style::default().fg(Color::Yellow)),
+            );
+            ("Confirm delete (playlist + tracks)", lines)
         }
     };
     let para = Paragraph::new(lines)
